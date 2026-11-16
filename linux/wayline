@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Wayline's Ubuntu/Debian terminal client."""
+
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import quote, unquote, urlsplit
+from uuid import uuid4
+
+
+ENGINE = Path("/usr/lib/wayline/wayline-engine")
+VERSION = "0.5.0"
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+PROFILES = CONFIG_HOME / "routeweave" / "profiles.json"
+SIZES = {"profile": 1024 * 1024, "session": 65535}
+FIELDS = {
+    "gateway": "", "port": 443, "username": "", "realm": "",
+    "certificateSha256": "", "mode": "proxy", "listenPort": 1080,
+    "dns": [], "before": [], "after": [],
+}
+
+
+def load():
+    if not PROFILES.exists():
+        return {}
+    profiles = json.loads(PROFILES.read_text(encoding="utf-8"))
+    if not isinstance(profiles, dict):
+        raise ValueError("Invalid saved profiles file.")
+    for profile in profiles.values():
+        if profile.get("xrayConfig") and not profile.get("xrays"):
+            identity=uuid4().hex
+            profile["xrays"]=[{"id":identity,"name":"Imported Xray","configFile":profile.pop("xrayConfig"),
+                              "executable":profile.pop("xrayExecutable",""),"outboundTag":profile.pop("xrayOutboundTag","")}]
+            profile.setdefault("after",[]).insert(0,{"type":"xray","xrayId":identity,"enabled":True})
+    return profiles
+
+
+def save(profiles):
+    PROFILES.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=PROFILES.parent, delete=False) as f:
+        temporary = Path(f.name)
+        try:
+            json.dump(profiles, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, PROFILES)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def port(value):
+    number = int(value)
+    if not 1 <= number <= 65535:
+        raise ValueError("Ports must be between 1 and 65535.")
+    return number
+
+
+def parse_hop(value):
+    enabled = not value.startswith("!")
+    value = value.removeprefix("!")
+    if value.startswith("xray:") and value[5:]:
+        return {"type":"xray","xrayId":value[5:],"enabled":enabled}
+    uri = urlsplit(value)
+    if (uri.scheme not in {"socks5", "http", "https"} or not uri.hostname or uri.port is None
+            or uri.password is not None or uri.path or uri.query or uri.fragment):
+        raise ValueError("Use a proxy URL such as socks5://user@127.0.0.1:10808. Enter proxy passwords at Connect.")
+    return {"enabled": enabled, "type": uri.scheme, "host": uri.hostname, "port": port(uri.port),
+            "username": unquote(uri.username or "")}
+
+
+def format_hop(hop):
+    if hop.get("type")=="xray":
+        return ("" if hop.get("enabled",True) else "!")+"xray:"+hop["xrayId"]
+    user = quote(hop["username"], safe="") + "@" if hop.get("username") else ""
+    host = "[" + hop["host"] + "]" if ":" in hop["host"] else hop["host"]
+    return ("" if hop.get("enabled", True) else "!") + f"{hop['type']}://{user}{host}:{hop['port']}"
+
+
+def normalize(profile, portable=False, allow_draft=False):
+    if not isinstance(profile, dict):
+        raise ValueError("Expected a Wayline profile object.")
+    result = {key: profile.get(key, default) for key, default in FIELDS.items()}
+    result["autoReconnect"]=bool(profile.get("autoReconnect",False))
+    result["appFilterMode"]="all" if portable else profile.get("appFilterMode","all")
+    result["appFilterApps"]=[] if portable else profile.get("appFilterApps",[])
+    if result["appFilterMode"] not in {"all","include","exclude"} or not isinstance(result["appFilterApps"],list) or len(result["appFilterApps"])>512 or any(not isinstance(v,str) or not v.startswith("/") or chr(0) in v for v in result["appFilterApps"]):raise ValueError("Use absolute executable paths for the app filter.")
+    result["trustedCertificates"]=profile.get("trustedCertificates",[])
+    if not isinstance(result["trustedCertificates"],list) or len(result["trustedCertificates"])>31 or any(not isinstance(v,str) or len(v)!=64 or any(c not in "0123456789abcdef" for c in v) for v in result["trustedCertificates"]):raise ValueError("Invalid trusted fingerprint list.")
+    for key in ("gateway", "username", "realm", "certificateSha256", "mode"):
+        if not isinstance(result[key], str):
+            raise ValueError(f"Invalid {key} in profile.")
+    if not allow_draft and (not result["gateway"] or not result["username"]):
+        raise ValueError("Enter a gateway and username.")
+    result["port"] = port(result["port"])
+    result["listenPort"] = port(result["listenPort"])
+    if result["listenPort"] < 1024 or result["mode"] not in {"proxy", "vpn"}:
+        raise ValueError("Use proxy or vpn mode and a local port between 1024 and 65535.")
+    if not isinstance(result["dns"], list) or any(not isinstance(ip, str) for ip in result["dns"]):
+        raise ValueError("DNS must be a list of IPv4 addresses.")
+    for side in ("before", "after"):
+        if not isinstance(result[side], list) or len(result[side]) > 8:
+            raise ValueError("Use up to eight proxy hops on each side.")
+        hops = []
+        for hop in result[side]:
+            if isinstance(hop,dict) and hop.get("type")=="xray":
+                if not portable:
+                    hops.append({"type":"xray","xrayId":hop.get("xrayId",""),"enabled":hop.get("enabled",True)})
+                continue
+            if not isinstance(hop, dict) or not isinstance(hop.get("host"), str) or not hop["host"]:
+                raise ValueError("Invalid proxy host.")
+            if hop.get("type") not in {"socks5", "http", "https"} or not isinstance(hop.get("username", ""), str):
+                raise ValueError("Invalid proxy type or username.")
+            if not isinstance(hop.get("enabled", True), bool):
+                raise ValueError("Hop enabled must be true or false.")
+            hops.append({"enabled": hop.get("enabled", True), "type": hop["type"], "host": hop["host"], "port": port(hop.get("port", 0)),
+                         "username": hop.get("username", "")})
+        result[side] = hops
+    return result
+
+
+def secret_tool(action, profile_id, password=None):
+    tool = shutil.which("secret-tool")
+    if tool is None:
+        if action == "store":
+            raise ValueError("Install libsecret-tools and unlock your desktop keyring to remember passwords.")
+        return ""
+    arguments = [tool, action]
+    if action == "store":
+        arguments.extend(["--label=Wayline VPN password"])
+    arguments.extend(["application", "routeweave", "profile", profile_id])
+    result = subprocess.run(arguments, input=password, capture_output=True, text=True, timeout=60)
+    if action == "store" and result.returncode:
+        raise ValueError("Could not save the password in the desktop keyring.")
+    return result.stdout.removesuffix("\n") if result.returncode == 0 and action == "lookup" else ""
+
+
+def ask(label, default="", allow_clear=False):
+    prompt = f"{label} [{default}]" if default else label
+    answer = input(prompt + ": ").strip()
+    if allow_clear and answer == "-":
+        return ""
+    return answer or default
+
+
+def configure(profiles, name):
+    old = profiles.get(name, {})
+    print("Press Enter to keep the current value. Enter - to clear optional fields.")
+    profile = {
+        "gateway": ask("SSL-VPN gateway", old.get("gateway", "")),
+        "port": ask("Gateway port", old.get("port", 443)),
+        "username": ask("Username", old.get("username", "")),
+        "realm": ask("Realm (optional)", old.get("realm", ""), True),
+        "certificateSha256": ask("IT-verified SHA-256 (optional)", old.get("certificateSha256", ""), True),
+        "mode": ask("Mode (proxy or vpn)", old.get("mode", "proxy")),
+        "listenPort": ask("Local SOCKS5/HTTP port", old.get("listenPort", 1080)),
+        "dns": ask("VPN DNS override (space-separated IPv4, optional)", " ".join(old.get("dns", [])), True).split(),
+    }
+    for side in ("before", "after"):
+        existing = " ".join(map(format_hop, old.get(side, [])))
+        profile[side] = [parse_hop(hop) for hop in ask(f"{side.title()} VPN proxy URLs (! prefix disables a hop)", existing, True).split()]
+    profile = normalize(profile)
+    profile["xrays"]=old.get("xrays",[])
+    profile["trustedCertificates"]=old.get("trustedCertificates",[])
+    profile["appFilterMode"]=ask("VPN app filter (all/include/exclude)",old.get("appFilterMode","all"))
+    profile["appFilterApps"]=shlex.split(ask("Executable paths (quote paths with spaces)",shlex.join(old.get("appFilterApps",[])),True))
+    profile["autoReconnect"]=ask("Auto reconnect (y/N)","y" if old.get("autoReconnect") else "n").lower()=="y"
+    path = ask("Xray exit JSON path (optional)", old.get("xrayConfig", ""), True)
+    if path:
+        config = Path(path).expanduser().resolve(strict=True)
+        if not config.is_file() or config.stat().st_size > SIZES["profile"]:
+            raise ValueError("Use an Xray JSON file up to 1 MiB.")
+        source = json.loads(config.read_text(encoding="utf-8-sig"))
+        if not isinstance(source, dict) or not isinstance(source.get("outbounds"), list):
+            raise ValueError("Choose an Xray JSON file with an outbounds array.")
+        executable = ask("Xray executable path (optional if installed on PATH)", old.get("xrayExecutable", ""), True)
+        identity=uuid4().hex
+        profile["xrays"].append({"id":identity,"name":config.stem,"configFile":str(config),"executable":executable,
+                                 "outboundTag":ask("Xray outbound tag (optional)","",True)})
+        profile["after"].append({"type":"xray","xrayId":identity,"enabled":True})
+    profile["id"] = old.get("id", uuid4().hex)
+    profiles[name] = profile
+    save(profiles)
+    print(f"Saved {name}.")
+
+
+def import_profile(profiles, source, name):
+    with Path(source).open("rb") as f:
+        data = f.read(SIZES["profile"] + 1)
+    if len(data) > SIZES["profile"]:
+        raise ValueError("Profile file exceeds 1 MiB.")
+    value = json.loads(data.decode("utf-8-sig"))
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    imported = normalize(value, portable=True)
+    name = name or value.get("name", "Imported profile")
+    if not isinstance(name, str) or not name.strip() or name in profiles:
+        raise ValueError("Choose a new profile name with --name.")
+    profiles[name] = dict(imported, id=uuid4().hex)
+    save(profiles)
+    print(f"Imported {name}.")
+
+
+def session_config(profile, mode=None):
+    if os.geteuid() == 0:
+        raise ValueError("Start Wayline as your desktop user. It requests sudo for the VPN adapter.")
+    session = normalize(profile)
+    session["mode"] = mode or session["mode"]
+    for side in ("before", "after"):
+        session[side] = [hop for hop in session[side] if hop["enabled"]]
+        for hop in session[side]:
+            if hop["type"]=="xray":
+                entry=next((entry for entry in profile.get("xrays",[]) if entry["id"]==hop["xrayId"]),None)
+                if entry is None:
+                    raise ValueError("Saved Xray configuration is missing.")
+                binary=entry.get("executable") or shutil.which("xray")
+                if not binary:
+                    raise ValueError("Set the Xray executable for this saved configuration.")
+                executable=Path(binary).expanduser().resolve(strict=True)
+                if not executable.is_file() or not os.access(executable,os.X_OK):
+                    raise ValueError("The Xray executable is unavailable.")
+                hop["xray"]={"executable":str(executable),"configFile":entry["configFile"],"outboundTag":entry.get("outboundTag","")}
+    if profile.get("xrayConfig"):
+        binary = profile.get("xrayExecutable") or shutil.which("xray")
+        if not binary:
+            raise ValueError("Install Xray or set its executable path with wayline configure.")
+        executable = Path(binary).expanduser().resolve(strict=True)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValueError("The Xray executable is unavailable.")
+        session["xrayExit"] = {
+            "executable": str(executable), "configFile": profile["xrayConfig"],
+            "outboundTag": profile.get("xrayOutboundTag", ""),
+        }
+    return session
+
+
+def import_xray(text):
+    data = text.encode("utf-8")
+    if len(data) > SIZES["profile"]:
+        raise ValueError("Xray input exceeds 1 MiB.")
+    result = subprocess.run([ENGINE, "--import-xray"], input=data, capture_output=True, timeout=10)
+    if result.returncode:
+        raise ValueError("Use Xray JSON or a supported vmess://, vless://, trojan:// or ss:// share link.")
+    config = json.loads(result.stdout)
+    directory = PROFILES.parent
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / ("xray-" + uuid4().hex + ".json")
+    with path.open("x") as output:
+        os.chmod(path, 0o600)
+        json.dump(config, output)
+    return str(path)
+
+
+def clipboard_xray():
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        command = ["wl-paste", "--no-newline"]
+    elif shutil.which("xclip"):
+        command = ["xclip", "-selection", "clipboard", "-o"]
+    elif shutil.which("xsel"):
+        command = ["xsel", "--clipboard", "--output"]
+    else:
+        raise ValueError("Install wl-clipboard, xclip or xsel, or pipe the link into import-xray --stdin.")
+    result = subprocess.run(command, capture_output=True, timeout=5, check=True)
+    if len(result.stdout) > SIZES["profile"]:
+        raise ValueError("Clipboard input exceeds 1 MiB.")
+    return result.stdout.decode("utf-8")
+
+
+def start_session(session, gui=False):
+    wire = (json.dumps(session, separators=(",", ":")) + "\n").encode()
+    if len(wire) > SIZES["session"]:
+        raise ValueError("Session configuration exceeds 64 KiB.")
+    env = os.environ.copy()
+    if gui:
+        env["WAYLINE_DESKTOP_SESSION"] = "1"
+    else:
+        env.pop("WAYLINE_DESKTOP_SESSION", None)
+    child = subprocess.Popen([ENGINE, "--session"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+    try:
+        child.stdin.write(wire)
+        child.stdin.flush()
+    except BaseException:
+        close_session_input(child)
+        child.wait()
+        child.stdout.close()
+        raise
+    return child
+
+
+def close_session_input(child):
+    try:
+        child.stdin.close()
+    except BrokenPipeError:
+        pass
+
+
+def connect(profile, mode=None, remember=False, password_stdin=False):
+    session = session_config(profile, mode)
+    def read_password(prompt):
+        if password_stdin:
+            return sys.stdin.readline().removesuffix("\n")
+        return getpass.getpass(prompt)
+
+    password = read_password("VPN password: ") if password_stdin else (
+        secret_tool("lookup", profile["id"]) or read_password("VPN password: "))
+    if not password:
+        raise ValueError("Enter your VPN password.")
+    if remember:
+        secret_tool("store", profile["id"], password)
+    session["password"] = password
+    for side in ("before", "after"):
+        for hop in session[side]:
+            if hop.get("username"):
+                hop["password"] = read_password(f"{side.title()} proxy password for {hop['host']}: ")
+    if session["mode"] == "vpn" and not password_stdin:
+        subprocess.run(["/usr/bin/sudo", "-v"], check=True)
+    child = start_session(session)
+    try:
+        print("Press Ctrl+C to disconnect.", flush=True)
+        for line in child.stdout:
+            event = json.loads(line)
+            if event["type"] == "stats":
+                continue
+            print(event["message"], flush=True)
+            if event["type"] == "certificate":
+                print("SHA-256 " + event["sha256"], flush=True)
+    except KeyboardInterrupt:
+        print("\nDisconnecting…", flush=True)
+    finally:
+        close_session_input(child)
+        try:
+            child.wait(timeout=12)
+        except subprocess.TimeoutExpired:
+            child.terminate()
+            child.wait()
+        child.stdout.close()
+    return child.returncode
+
+
+def menu(profiles):
+    while True:
+        print("\nWayline\n  1. Connect\n  2. Create or edit a profile\n  3. List profiles\n  4. Exit")
+        action = ask("Choose", "1" if profiles else "2")
+        try:
+            if action == "1" and profiles:
+                profile = profiles[ask("Profile", next(iter(profiles)))]
+                connect(profile, remember=ask("Remember VPN password in desktop keyring (y/N)", "n").lower() == "y")
+            elif action == "2":
+                name = ask("Profile name", next(iter(profiles), "VPN"))
+                configure(profiles, name)
+            elif action in {"1", "3"}:
+                print("\n".join(profiles) or "No saved profiles.")
+            elif action == "4":
+                return 0
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+            print(f"Wayline: {error}", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Wayline SSL-VPN for Ubuntu/Debian")
+    parser.add_argument("--version", action="version", version=f"Wayline {VERSION}")
+    parser.add_argument("--gui", action="store_true", help="open the optional desktop window")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("profiles", help="list saved profiles")
+    commands.add_parser("configure", help="create or edit a profile").add_argument("name")
+    run = commands.add_parser("connect", help="connect a saved profile")
+    run.add_argument("name")
+    run.add_argument("--mode", choices=["proxy", "vpn"])
+    run.add_argument("--remember", action="store_true", help="save the VPN password in the desktop keyring")
+    run.add_argument("--password-stdin", action="store_true", help="read passwords from stdin without prompts")
+    imported = commands.add_parser("import", help="import one Wayline profile JSON file")
+    imported.add_argument("file")
+    imported.add_argument("--name")
+    exported = commands.add_parser("export", help="write portable profile JSON to stdout")
+    exported.add_argument("name")
+    commands.add_parser("forget-password", help="clear a saved password").add_argument("name")
+    hops = commands.add_parser("hops", help="list hops and their enabled state")
+    hops.add_argument("name")
+    hop = commands.add_parser("hop", help="enable or disable a saved hop")
+    hop.add_argument("name")
+    hop.add_argument("side", choices=["before", "after"])
+    hop.add_argument("index", type=int, help="one-based hop number")
+    hop.add_argument("state", choices=["on", "off"])
+    xray = commands.add_parser("import-xray", help="import Xray JSON or a share link")
+    xray.add_argument("name")
+    xray.add_argument("--label",default="Xray")
+    source = xray.add_mutually_exclusive_group(required=True)
+    source.add_argument("--stdin", action="store_true")
+    source.add_argument("--clipboard", action="store_true")
+    source.add_argument("--link")
+    library=commands.add_parser("xrays",help="list saved Xray configurations")
+    library.add_argument("name")
+    manage=commands.add_parser("xray",help="enable, disable, move or delete an Xray")
+    manage.add_argument("name")
+    manage.add_argument("index",type=int)
+    manage.add_argument("action",choices=["on","off","before","after","delete"])
+    apps=commands.add_parser("apps",help="show app routing policy");apps.add_argument("name")
+    app_filter=commands.add_parser("app-filter",help="set VPN app routing policy");app_filter.add_argument("name");app_filter.add_argument("mode",choices=["all","include","exclude"]);app_filter.add_argument("executables",nargs="*")
+    args = parser.parse_args()
+    if args.gui:
+        if args.command:
+            parser.error("--gui opens the desktop window and takes no subcommand")
+        if os.geteuid() == 0:
+            raise ValueError("Start Wayline as your desktop user.")
+        sys.path.insert(0, str(ENGINE.parent))
+        try:
+            from wayline_gui import run_gui
+        except ImportError as error:
+            if error.name in {"tkinter", "_tkinter"}:
+                raise ValueError("Install python3-tk to open the desktop window.") from error
+            raise
+        return run_gui(sys.modules[__name__])
+    profiles = load()
+    if not args.command:
+        return menu(profiles)
+    if args.command == "profiles":
+        print("\n".join(profiles) or "No saved profiles.")
+    elif args.command=="apps":
+        profile=profiles[args.name];print(profile.get("appFilterMode","all"));print("\n".join(profile.get("appFilterApps",[])))
+    elif args.command=="app-filter":
+        profile=profiles[args.name];profile["appFilterMode"]=args.mode;profile["appFilterApps"]=[str(Path(v).expanduser().resolve()) for v in args.executables];normalize(profile);save(profiles)
+    elif args.command == "configure":
+        configure(profiles, args.name)
+    elif args.command == "connect":
+        return connect(profiles[args.name], args.mode, args.remember, args.password_stdin)
+    elif args.command == "import":
+        import_profile(profiles, args.file, args.name)
+    elif args.command == "export":
+        print(json.dumps(dict(normalize(profiles[args.name],portable=True), name=args.name), indent=2))
+    elif args.command == "forget-password":
+        secret_tool("clear", profiles[args.name]["id"])
+    elif args.command == "hops":
+        for side in ("before", "after"):
+            for index, hop in enumerate(profiles[args.name].get(side, []), start=1):
+                tick = "x" if hop.get("enabled", True) else " "
+                print(f"{side} {index} [{tick}] {format_hop(hop).removeprefix('!')}")
+    elif args.command == "hop":
+        chain = profiles[args.name].get(args.side, [])
+        if args.index < 1 or args.index > len(chain):
+            raise ValueError("Hop index is outside the saved list.")
+        chain[args.index - 1]["enabled"] = args.state == "on"
+        save(profiles)
+    elif args.command == "import-xray":
+        profile = profiles[args.name]
+        if args.stdin:
+            text = sys.stdin.read(SIZES["profile"] + 1)
+        else:
+            text = clipboard_xray() if args.clipboard else args.link
+        path = import_xray(text)
+        identity=uuid4().hex
+        profile.setdefault("xrays",[]).append({"id":identity,"name":(args.label if args.label!="Xray" else json.loads(Path(path).read_text()).get("remarks") or "Xray"),"configFile":path,"executable":"","outboundTag":""})
+        profile.setdefault("after",[]).append({"type":"xray","xrayId":identity,"enabled":True})
+        save(profiles)
+    elif args.command=="xrays":
+        profile=profiles[args.name]
+        for index,entry in enumerate(profile.get("xrays",[]),1):
+            active=any(h.get("xrayId")==entry["id"] and h.get("enabled",True) for side in ("before","after") for h in profile.get(side,[]))
+            print(f"{index} [{'x' if active else ' '}] {entry['name']}")
+    elif args.command=="xray":
+        profile=profiles[args.name]
+        library=profile.get("xrays",[])
+        if args.index<1 or args.index>len(library):raise ValueError("Xray index is outside the library.")
+        entry=library[args.index-1]
+        references=[h for side in ("before","after") for h in profile.get(side,[]) if h.get("xrayId")==entry["id"]]
+        if args.action in {"on","off"}:
+            for hop in references:hop["enabled"]=args.action=="on"
+            if args.action=="on" and not references:profile.setdefault("after",[]).append({"type":"xray","xrayId":entry["id"],"enabled":True})
+        else:
+            for side in ("before","after"):profile[side]=[h for h in profile.get(side,[]) if h.get("xrayId")!=entry["id"]]
+            if args.action=="delete":library.remove(entry)
+            else:profile.setdefault(args.action,[]).append({"type":"xray","xrayId":entry["id"],"enabled":True})
+        save(profiles)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+        sys.exit(f"Wayline: {error}")
+    except (KeyboardInterrupt, EOFError):
+        sys.exit(130)

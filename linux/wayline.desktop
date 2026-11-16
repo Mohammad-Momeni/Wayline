@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Wayline
+Comment=Connect to a Fortinet SSL VPN
+Exec=wayline --gui
+Icon=wayline
+Terminal=false
+Categories=Network;
